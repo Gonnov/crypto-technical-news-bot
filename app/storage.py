@@ -110,3 +110,42 @@ def last_updated(day: str | None = None) -> datetime | None:
     if not path.exists():
         return None
     return datetime.fromtimestamp(path.stat().st_mtime)
+
+
+# ---------- Article map: short_id -> {source, title, url, image_url?} ----------
+
+ARTICLES_FILE = "articles.json"
+
+
+def _articles_path() -> Path:
+    return _root() / ARTICLES_FILE
+
+
+def save_articles(mapping: dict[str, dict[str, Any]]) -> None:
+    """Persist the article lookup table used for Telegram button callbacks.
+
+    Telegram restricts callback_data to 64 bytes, so we reference articles via
+    short IDs and resolve them here when a button is pressed.
+    """
+    _articles_path().write_text(json.dumps(mapping, indent=2, default=str))
+
+
+def load_articles() -> dict[str, dict[str, Any]]:
+    path = _articles_path()
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def get_article(article_id: str) -> dict[str, Any] | None:
+    return load_articles().get(article_id)
+
+
+def upsert_articles(mapping: dict[str, dict[str, Any]]) -> None:
+    """Merge new articles into the existing map (does not evict)."""
+    existing = load_articles()
+    existing.update(mapping)
+    save_articles(existing)

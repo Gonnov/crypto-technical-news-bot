@@ -2,14 +2,22 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import html as _html
 import logging
 from collections import defaultdict
+from typing import Any
 
-from telegram import Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -17,21 +25,133 @@ from telegram.ext import (
 )
 
 from . import storage
+from .article_fetcher import fetch_article
 from .config import settings
 from .renderer import (
     render_all_markdown,
+    render_cryptoast_card,
     render_intro,
     render_item,
+    render_messari_card,
+    render_recap_card,
     render_spotlight,
+    render_spotlight_body,
+    render_spotlight_header,
     render_takeaways,
 )
-from .sources_client import fetch_all
-from .summarizer import DigestBundle, answer_question, generate_digest
+from .sources_client import fetch_all, fetch_og_images
+from .summarizer import DigestBundle, answer_question, generate_digest, summarize_article
 
 log = logging.getLogger(__name__)
 
 TELEGRAM_LIMIT = 4000
-INTER_MESSAGE_DELAY = 0.8  # seconds between newsletter messages
+INTER_MESSAGE_DELAY = 1.2  # seconds between newsletter messages (avoids Telegram flood control)
+INFO_CALLBACK_PREFIX = "info:"
+
+
+def _h_esc(s: str) -> str:
+    """HTML-escape for Telegram parse_mode=HTML."""
+    return _html.escape(s or "", quote=False)
+
+
+def _truncate_html(text: str, limit: int) -> str:
+    """Truncate Telegram-HTML safely: cut on a line boundary and close any open tags.
+
+    Telegram only accepts a small tag set (b, i, a, code, pre, u, s). We only
+    use b/i/a here, so a light-touch closer is enough.
+    """
+    if len(text) <= limit:
+        return text
+    # Trim to the last newline before the budget (leave ~20 chars for closers).
+    budget = max(1, limit - 20)
+    cut = text.rfind("\n", 0, budget)
+    trimmed = text[: cut if cut > 0 else budget].rstrip()
+    # Close any open tags we might have cut through.
+    for tag in ("b", "i"):
+        opens = trimmed.count(f"<{tag}>") + trimmed.count(f"<{tag} ")
+        closes = trimmed.count(f"</{tag}>")
+        if opens > closes:
+            trimmed += f"</{tag}>" * (opens - closes)
+    # Also close any dangling <a ...> link tags.
+    if trimmed.count("<a ") > trimmed.count("</a>"):
+        trimmed += "</a>" * (trimmed.count("<a ") - trimmed.count("</a>"))
+    return trimmed + "\n…"
+
+
+def _article_id(url: str) -> str:
+    """Short stable id for callback_data (Telegram limits it to 64 bytes)."""
+    return hashlib.sha1((url or "").encode("utf-8")).hexdigest()[:12]
+
+
+def _favicon_url(article_url: str) -> str:
+    """Fallback image when og:image isn't available — Google's s2 favicon service."""
+    if not article_url:
+        return ""
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(article_url).netloc
+        if not host:
+            return ""
+        return f"https://www.google.com/s2/favicons?domain={host}&sz=128"
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _slug(name: str) -> str:
+    """Loose name match: lowercase, alphanumeric only."""
+    import re as _re
+    return _re.sub(r"[^a-z0-9]+", "", (name or "").lower())
+
+
+def _find_protocol_logo(spotlight_name: str, protocols: list[dict] | None) -> str:
+    """Match the spotlight name against DeFiLlama's protocol list for a logo URL."""
+    if not spotlight_name or not protocols:
+        return ""
+    target = _slug(spotlight_name)
+    if not target:
+        return ""
+    # Exact slug match first
+    for p in protocols:
+        if _slug(p.get("name", "")) == target or _slug(p.get("slug", "")) == target:
+            return p.get("logo") or ""
+    # Fallback: the first protocol whose slug starts with the target (handles "Morpho" -> "MorphoBlue")
+    for p in protocols:
+        pslug = _slug(p.get("name", ""))
+        if pslug and (pslug.startswith(target) or target.startswith(pslug)):
+            return p.get("logo") or ""
+    return ""
+
+
+def _info_keyboard(article_id: str, extra_url: str | None = None) -> InlineKeyboardMarkup:
+    """Inline keyboard with 'Plus d'infos' callback and optional direct link."""
+    row: list[InlineKeyboardButton] = []
+    if extra_url:
+        row.append(InlineKeyboardButton("🔗 Lire", url=extra_url))
+    row.append(InlineKeyboardButton("ℹ️ Plus d'infos", callback_data=f"{INFO_CALLBACK_PREFIX}{article_id}"))
+    return InlineKeyboardMarkup([row])
+
+
+def _collect_articles(payload: dict[str, Any] | None, bundle: DigestBundle | None) -> dict[str, dict[str, Any]]:
+    """Build the {article_id: {source,title,url}} map for today's callbacks."""
+    mapping: dict[str, dict[str, Any]] = {}
+    payload = payload or {}
+    for it in payload.get("cryptoast", []) or []:
+        url = it.get("link")
+        if not url:
+            continue
+        mapping[_article_id(url)] = {"source": "Cryptoast", "title": it.get("title", ""), "url": url}
+    for it in payload.get("messari", []) or []:
+        url = it.get("link")
+        if not url:
+            continue
+        mapping[_article_id(url)] = {"source": "Messari", "title": it.get("title", ""), "url": url}
+    if bundle is not None:
+        for r in bundle.recap or []:
+            url = r.link
+            if not url:
+                continue
+            mapping[_article_id(url)] = {"source": r.source, "title": r.headline, "url": url}
+    return mapping
 
 # In-memory per-chat conversation history
 _history: dict[int, list[dict[str, str]]] = defaultdict(list)
@@ -71,23 +191,128 @@ async def _send_html(bot, chat_id: int, text: str) -> None:
             await bot.send_message(chat_id, plain)
 
 
-async def _send_bundle(bot, chat_id: int, bundle: DigestBundle) -> None:
-    await _send_html(bot, chat_id, render_intro(bundle))
-    await asyncio.sleep(INTER_MESSAGE_DELAY)
-    await _send_html(bot, chat_id, render_spotlight(bundle.spotlight))
-    total = len(bundle.items)
-    for idx, item in enumerate(bundle.items, 1):
-        await asyncio.sleep(INTER_MESSAGE_DELAY)
+async def _send_photo_card(
+    bot, chat_id: int, image_url: str, caption: str,
+    keyboard: InlineKeyboardMarkup | None = None,
+) -> None:
+    """Send a photo with caption + optional inline keyboard. Fall back to text if the upload fails."""
+    try:
+        await bot.send_photo(
+            chat_id, image_url, caption=caption, parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("send_photo failed, falling back to text: %s", e)
         try:
-            await bot.send_chat_action(chat_id, ChatAction.TYPING)
-        except Exception:  # noqa: BLE001
-            pass
-        await _send_html(bot, chat_id, render_item(item, idx, total))
+            await bot.send_message(
+                chat_id, caption, parse_mode=ParseMode.HTML, reply_markup=keyboard,
+            )
+        except Exception as e2:  # noqa: BLE001
+            log.warning("send_message fallback also failed: %s", e2)
+
+
+async def _send_text_card(
+    bot, chat_id: int, text: str, keyboard: InlineKeyboardMarkup | None = None
+) -> None:
+    try:
+        await bot.send_message(
+            chat_id, text, parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True, reply_markup=keyboard,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("send_message card failed: %s", e)
+
+
+async def _send_bundle(bot, chat_id: int, bundle: DigestBundle, payload: dict | None = None) -> None:
+    payload = payload or {}
+
+    # Persist article map for callback resolution.
+    storage.save_articles(_collect_articles(payload, bundle))
+
+    # --- Intro FIRST (greeting card) ---
+    await _send_text_card(bot, chat_id, render_intro(bundle))
     await asyncio.sleep(INTER_MESSAGE_DELAY)
-    await _send_html(bot, chat_id, render_takeaways(bundle))
+
+    # --- Cryptoast: one photo card per article (title + image + Lire + Plus d'infos) ---
+    cryptoast = payload.get("cryptoast") or []
+    if cryptoast:
+        await _send_text_card(bot, chat_id, "🗞 <b>CRYPTOAST · ACTU DU JOUR</b>")
+        await asyncio.sleep(INTER_MESSAGE_DELAY)
+        for it in cryptoast:
+            url = it.get("link", "")
+            kb = _info_keyboard(_article_id(url), extra_url=url or None)
+            caption = render_cryptoast_card(it)
+            img = it.get("image_url") or ""
+            if img:
+                await _send_photo_card(bot, chat_id, img, caption, kb)
+            else:
+                await _send_text_card(bot, chat_id, caption, kb)
+            await asyncio.sleep(INTER_MESSAGE_DELAY)
+
+    # --- Messari: one card per research report (image + title + author + Lire + Plus d'infos) ---
+    messari = payload.get("messari") or []
+    if messari:
+        await _send_text_card(bot, chat_id, "📚 <b>MESSARI · TOP RESEARCH</b>")
+        await asyncio.sleep(INTER_MESSAGE_DELAY)
+        for it in messari:
+            url = it.get("link", "")
+            kb = _info_keyboard(_article_id(url), extra_url=url or None)
+            caption = render_messari_card(it)
+            img = it.get("image_url") or ""
+            if img:
+                await _send_photo_card(bot, chat_id, img, caption, kb)
+            else:
+                await _send_text_card(bot, chat_id, caption, kb)
+            await asyncio.sleep(INTER_MESSAGE_DELAY)
+
+    # --- News recap: one card per headline (image + title + summary + Read + More info) ---
+    if bundle.recap:
+        await _send_text_card(bot, chat_id, "📣 <b>NEWS RECAP</b>")
+        await asyncio.sleep(INTER_MESSAGE_DELAY)
+        recap_urls = [r.link or "" for r in bundle.recap]
+        recap_images = await fetch_og_images(recap_urls)
+        for r, img in zip(bundle.recap, recap_images):
+            kb = _info_keyboard(_article_id(r.link), extra_url=r.link or None)
+            caption = render_recap_card(r.model_dump())
+            # Fall back to the source domain's favicon if og:image is missing.
+            if not img:
+                img = _favicon_url(r.link)
+            if img:
+                await _send_photo_card(bot, chat_id, img, caption, kb)
+            else:
+                await _send_text_card(bot, chat_id, caption, kb)
+            await asyncio.sleep(INTER_MESSAGE_DELAY)
+
+    # --- Spotlight: photo + short header caption, then full body as text.
+    # The body auto-splits on paragraph boundaries via _send_html when it
+    # exceeds 4000 chars, so it can naturally span 2-3 messages when Gemini
+    # produces deep mechanical content.
+    sp = bundle.spotlight
+    logo = _find_protocol_logo(sp.name, payload.get("protocol_logos"))
+    header_caption = render_spotlight_header(sp)
+    if len(header_caption) > 1024:
+        header_caption = _truncate_html(header_caption, 1024)
+
+    sent_photo = False
+    if logo:
+        try:
+            await bot.send_photo(chat_id, logo, caption=header_caption, parse_mode=ParseMode.HTML)
+            sent_photo = True
+        except Exception as e:  # noqa: BLE001
+            log.warning("spotlight photo send failed (%s): %s — falling back to text header", logo, e)
+    if not sent_photo:
+        await _send_text_card(bot, chat_id, header_caption)
+    await asyncio.sleep(INTER_MESSAGE_DELAY)
+
+    # Body — _send_html splits on \n\n when above TELEGRAM_LIMIT (4000 chars).
+    await _send_html(bot, chat_id, render_spotlight_body(sp))
+    await asyncio.sleep(INTER_MESSAGE_DELAY)
+
+    # --- Takeaways ---
+    await _send_text_card(bot, chat_id, render_takeaways(bundle))
 
 
-async def _produce_digest(force_refresh: bool = False) -> DigestBundle:
+async def _produce_digest(force_refresh: bool = False) -> tuple[DigestBundle, dict]:
     payload = None if force_refresh else storage.load_payload()
     if payload is None:
         log.info("Fetching sources (force=%s)...", force_refresh)
@@ -101,12 +326,12 @@ async def _produce_digest(force_refresh: bool = False) -> DigestBundle:
         bundle = generate_digest(payload, recent_spotlights=recent)
 
         # Guard: if Gemini picked a protocol already covered (even via a variant),
-        # retry with the duplicate added to the blocklist. Cap retries at 2.
-        for attempt in range(2):
+        # retry with the duplicate added to the blocklist. Cap retries at 4.
+        for attempt in range(4):
             if not storage.spotlight_already_covered(bundle.spotlight.name):
                 break
             log.warning(
-                "Spotlight '%s' already covered — retrying (attempt %d/2).",
+                "Spotlight '%s' already covered — retrying (attempt %d/4).",
                 bundle.spotlight.name, attempt + 1,
             )
             recent = recent + [bundle.spotlight.name]
@@ -117,14 +342,15 @@ async def _produce_digest(force_refresh: bool = False) -> DigestBundle:
 
         storage.save_digest(bundle, render_all_markdown(bundle))
         storage.record_spotlight(bundle.spotlight.name)
-    return bundle
+    return bundle, payload
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
+    from datetime import date
     await update.message.reply_text(
-        "Web3 Builder Digest Bot\n\n"
+        f"☀️ Hi Valentin — {date.today().isoformat()}\n\n"
         "Commands:\n"
         "/digest — show today's digest\n"
         "/refresh — re-fetch sources and regenerate\n"
@@ -137,8 +363,8 @@ async def cmd_digest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
     await update.message.chat.send_action(ChatAction.TYPING)
-    bundle = await _produce_digest(force_refresh=False)
-    await _send_bundle(ctx.bot, update.effective_chat.id, bundle)
+    bundle, payload = await _produce_digest(force_refresh=False)
+    await _send_bundle(ctx.bot, update.effective_chat.id, bundle, payload)
 
 
 async def cmd_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -146,8 +372,8 @@ async def cmd_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await update.message.chat.send_action(ChatAction.TYPING)
     _history[update.effective_chat.id].clear()
-    bundle = await _produce_digest(force_refresh=True)
-    await _send_bundle(ctx.bot, update.effective_chat.id, bundle)
+    bundle, payload = await _produce_digest(force_refresh=True)
+    await _send_bundle(ctx.bot, update.effective_chat.id, bundle, payload)
 
 
 async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -199,12 +425,73 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await ctx.bot.send_message(chat_id, c)
 
 
+async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle 'Plus d'infos' button clicks: fetch the article and send a deep-dive."""
+    q = update.callback_query
+    if q is None:
+        return
+    chat = update.effective_chat
+    if chat is None or chat.id != settings.telegram_chat_id:
+        await q.answer("Not authorized.", show_alert=True)
+        return
+    data = (q.data or "").strip()
+    if not data.startswith(INFO_CALLBACK_PREFIX):
+        await q.answer()
+        return
+    article_id = data[len(INFO_CALLBACK_PREFIX):]
+    article = storage.get_article(article_id)
+    if not article:
+        await q.answer("Article not found in today's index.", show_alert=True)
+        return
+
+    await q.answer("Fetching article…")
+    try:
+        await ctx.bot.send_chat_action(chat.id, ChatAction.TYPING)
+    except Exception:  # noqa: BLE001
+        pass
+
+    source = article.get("source") or ""
+    title = article.get("title") or ""
+    url = article.get("url") or ""
+
+    try:
+        fetched = await fetch_article(url, source=source)
+    except Exception as e:  # noqa: BLE001
+        log.exception("fetch_article failed")
+        await _send_text_card(ctx.bot, chat.id, f"<i>Article fetch failed:</i> {e}")
+        return
+
+    body = fetched.get("text") or ""
+    if not body:
+        await _send_text_card(
+            ctx.bot, chat.id,
+            "<i>Couldn't extract article body — the site may be JS-heavy or paywalled.</i>",
+        )
+        return
+
+    # Run the blocking Gemini call off the event loop.
+    try:
+        item = await asyncio.to_thread(
+            summarize_article,
+            url=url,
+            title=fetched.get("title") or title,
+            source=source,
+            body=body,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.exception("summarize_article failed")
+        await _send_text_card(ctx.bot, chat.id, f"<i>Summary generation failed:</i> {e}")
+        return
+
+    await _send_html(ctx.bot, chat.id, render_item(item, idx=1, total=1))
+
+
 async def send_daily_digest(app: Application) -> None:
     log.info("Running daily digest job.")
     _history[settings.telegram_chat_id].clear()
     try:
-        bundle = await _produce_digest(force_refresh=True)
-        await _send_bundle(app.bot, settings.telegram_chat_id, bundle)
+        bundle, payload = await _produce_digest(force_refresh=True)
+        await _send_bundle(app.bot, settings.telegram_chat_id, bundle, payload)
     except Exception as e:  # noqa: BLE001
         log.exception("Daily digest failed")
         try:
@@ -219,5 +506,6 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("digest", cmd_digest))
     app.add_handler(CommandHandler("refresh", cmd_refresh))
     app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CallbackQueryHandler(on_callback, pattern=rf"^{INFO_CALLBACK_PREFIX}"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     return app
