@@ -25,6 +25,18 @@ def client() -> genai.Client:
     return _client
 
 
+def is_quota_error(exc: BaseException) -> bool:
+    """True for Gemini 429 / RESOURCE_EXHAUSTED errors."""
+    from google.genai import errors as genai_errors
+    if isinstance(exc, genai_errors.APIError):
+        if getattr(exc, "code", None) == 429:
+            return True
+        msg = str(exc)
+        if "RESOURCE_EXHAUSTED" in msg or "429" in msg:
+            return True
+    return False
+
+
 # ---------- Structured output schema ----------
 
 Category = Literal["Research", "Blog", "News", "Launch", "Metric", "Repo"]
