@@ -400,7 +400,12 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         answer = answer_question(question, payload, digest_md, history=hist)
     except Exception as e:  # noqa: BLE001
         log.exception("answer_question failed")
-        await update.message.reply_text(f"Error while answering: {e}")
+        if is_quota_error(e):
+            await update.message.reply_text(
+                "Gemini is rate-limited right now — please retry in a few minutes."
+            )
+        else:
+            await update.message.reply_text(f"Error while answering: {e}")
         return
 
     hist.append({"role": "user", "content": question})
@@ -482,7 +487,13 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
     except Exception as e:  # noqa: BLE001
         log.exception("summarize_article failed")
-        await _send_text_card(ctx.bot, chat.id, f"<i>Summary generation failed:</i> {e}")
+        if is_quota_error(e):
+            await _send_text_card(
+                ctx.bot, chat.id,
+                "<i>Gemini is rate-limited right now — please retry in a few minutes.</i>",
+            )
+        else:
+            await _send_text_card(ctx.bot, chat.id, f"<i>Summary generation failed:</i> {e}")
         return
 
     await _send_html(ctx.bot, chat.id, render_item(item, idx=1, total=1))
