@@ -40,13 +40,15 @@ from .renderer import (
     render_takeaways,
 )
 from .sources_client import fetch_all, fetch_og_images
-from .summarizer import DigestBundle, answer_question, generate_digest, summarize_article
+from .summarizer import DigestBundle, answer_question, generate_digest, is_quota_error, summarize_article
 
 log = logging.getLogger(__name__)
 
 TELEGRAM_LIMIT = 4000
 INTER_MESSAGE_DELAY = 1.2  # seconds between newsletter messages (avoids Telegram flood control)
 INFO_CALLBACK_PREFIX = "info:"
+DAILY_RETRY_DELAY = 3600  # 1 hour between daily-digest retries on quota errors
+DAILY_MAX_RETRIES = 3
 
 
 def _h_esc(s: str) -> str:
@@ -486,18 +488,40 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _send_html(ctx.bot, chat.id, render_item(item, idx=1, total=1))
 
 
-async def send_daily_digest(app: Application) -> None:
-    log.info("Running daily digest job.")
-    _history[settings.telegram_chat_id].clear()
+async def send_daily_digest(app: Application, attempt: int = 0) -> None:
+    log.info("Running daily digest job (attempt %d).", attempt)
+    if attempt == 0:
+        _history[settings.telegram_chat_id].clear()
     try:
-        bundle, payload = await _produce_digest(force_refresh=True)
+        # On retries reuse the cached payload — only Gemini gets re-called.
+        bundle, payload = await _produce_digest(force_refresh=(attempt == 0))
         await _send_bundle(app.bot, settings.telegram_chat_id, bundle, payload)
     except Exception as e:  # noqa: BLE001
+        if is_quota_error(e) and attempt < DAILY_MAX_RETRIES:
+            log.warning(
+                "Gemini quota exhausted on daily digest (attempt %d/%d). Retrying in %ds.",
+                attempt + 1, DAILY_MAX_RETRIES, DAILY_RETRY_DELAY,
+            )
+            app.job_queue.run_once(
+                _retry_daily_job,
+                when=DAILY_RETRY_DELAY,
+                data={"attempt": attempt + 1},
+                name=f"daily_digest_retry_{attempt + 1}",
+            )
+            return
         log.exception("Daily digest failed")
         try:
-            await app.bot.send_message(settings.telegram_chat_id, f"Daily digest failed: {e}")
+            suffix = " (quota exhausted, no more retries today)" if is_quota_error(e) else ""
+            await app.bot.send_message(
+                settings.telegram_chat_id, f"Daily digest failed{suffix}: {e}"
+            )
         except Exception:  # noqa: BLE001
             pass
+
+
+async def _retry_daily_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    attempt = (ctx.job.data or {}).get("attempt", 1) if ctx.job else 1
+    await send_daily_digest(ctx.application, attempt=attempt)
 
 
 def build_app() -> Application:
